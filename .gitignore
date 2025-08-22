@@ -1,2 +1,5 @@
 /instancia
 /.env
+/__pycache__
+/__init__.py
+/.vscode
