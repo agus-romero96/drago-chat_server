@@ -1,5 +1,8 @@
 import json
 from typing import List, Optional
+from dotenv import load_dotenv
+
+load_dotenv() # Carga las variables del .env
 
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import OAuth2PasswordRequestForm
