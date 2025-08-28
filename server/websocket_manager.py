@@ -1,12 +1,10 @@
-from typing import List, Dict, DefaultDict
+from typing import List, Dict, DefaultDict, Optional
 from collections import defaultdict
 from fastapi import WebSocket
 
 class ConnectionManager:
     def __init__(self):
-        # Maps a room name to a list of active WebSocket connections in that room
         self.rooms: DefaultDict[str, List[WebSocket]] = defaultdict(list)
-        # Maps a username to their active WebSocket connection
         self.user_connections: Dict[str, WebSocket] = {}
 
     async def connect(self, websocket: WebSocket, username: str, room_name: str):
@@ -15,9 +13,8 @@ class ConnectionManager:
         self.user_connections[username] = websocket
 
     def disconnect(self, websocket: WebSocket, username: str, room_name: str):
-        if room_name in self.rooms:
+        if room_name in self.rooms and websocket in self.rooms[room_name]:
             self.rooms[room_name].remove(websocket)
-            # If the room is empty after disconnecting, remove the room key
             if not self.rooms[room_name]:
                 del self.rooms[room_name]
         
@@ -29,17 +26,18 @@ class ConnectionManager:
             websocket = self.user_connections[username]
             await websocket.send_text(message)
 
-    async def broadcast_to_room(self, message: str, room_name: str):
+    async def broadcast_to_room(self, message: str, room_name: str, exclude_websocket: Optional[WebSocket] = None):
         if room_name in self.rooms:
             for connection in self.rooms[room_name]:
+                if connection is not exclude_websocket:
+                    await connection.send_text(message)
+
+    async def broadcast_to_all(self, message: str, exclude_websocket: Optional[WebSocket] = None):
+        for connection in self.user_connections.values():
+            if connection is not exclude_websocket:
                 await connection.send_text(message)
 
     def get_users_in_room(self, room_name: str) -> List[str]:
-        # This is a bit inefficient. A better approach would be to store users per room.
-        # For now, this will work. We can optimize later if needed.
-        # This requires a reverse lookup from the websocket object back to the username.
-        # We will handle this logic in the main endpoint for now.
-        # This method is a placeholder for that logic.
         pass
 
 manager = ConnectionManager()

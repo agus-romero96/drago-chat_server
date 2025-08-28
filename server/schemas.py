@@ -33,7 +33,7 @@ class UserOut(UserBase):
     current_room_id: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class StatusUpdate(BaseModel):
     status_message: str
@@ -50,7 +50,7 @@ class RoomOut(RoomBase):
     owner: UserOut # Nested schema to show owner details
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class RoomPrivacyUpdate(BaseModel):
     is_private: bool
