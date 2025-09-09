@@ -30,12 +30,31 @@ class ConnectionManager:
         if room_name in self.rooms:
             for connection in self.rooms[room_name]:
                 if connection is not exclude_websocket:
-                    await connection.send_text(message)
+                    try:
+                        await connection.send_text(message)
+                    except Exception as e:
+                        print(f"!!! ERROR al enviar texto a una conexión: {e}. Continuando.")
 
+    async def broadcast_binary_to_room(self, data: bytes, room_name: str, exclude_websocket: Optional[WebSocket] = None):
+        """Envía datos binarios a todos en una sala, excluyendo al remitente."""
+        if room_name in self.rooms:
+            for connection in self.rooms[room_name]:
+                if connection is not exclude_websocket:
+                    try:
+                        await connection.send_bytes(data)
+                    except Exception as e:
+                        print(f"!!! ERROR al enviar binarios a una conexión: {e}. Continuando.")
+
+    # --- FUNCIÓN CORREGIDA / AÑADIDA DE NUEVO ---
     async def broadcast_to_all(self, message: str, exclude_websocket: Optional[WebSocket] = None):
+        """Envía un mensaje de texto a todos los usuarios conectados."""
         for connection in self.user_connections.values():
             if connection is not exclude_websocket:
-                await connection.send_text(message)
+                try:
+                    await connection.send_text(message)
+                except Exception as e:
+                    print(f"!!! ERROR al enviar a todos: {e}. Continuando.")
+    # --- FIN DE LA CORRECCIÓN ---
 
     def get_users_in_room(self, room_name: str) -> List[str]:
         pass

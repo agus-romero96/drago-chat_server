@@ -1,9 +1,5 @@
 import json
-from typing import List, Optional
-from dotenv import load_dotenv # AÑADE ESTA LÍNEA
-
-
-load_dotenv() 
+from typing import List
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, Query
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +7,7 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import func
 
-from .database import create_db_and_tables, get_db
+from .database import create_db_and_tables, get_db, AsyncSessionLocal
 from .models import User, UserRole, Room
 from .auth import (
     get_password_hash, verify_password, create_access_token, 
@@ -19,6 +15,9 @@ from .auth import (
 )
 from .websocket_manager import manager
 from . import schemas
+from dotenv import load_dotenv
+
+load_dotenv() 
 
 app = FastAPI(title="DragoChat Server")
 
@@ -91,26 +90,37 @@ async def create_room(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
+    # Comprobar si ya existe una sala con ese nombre
     result = await db.execute(select(Room).filter(Room.name == room_data.name))
     if result.scalar_one_or_none():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Room name already exists")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El nombre de la sala ya existe")
 
+    # Crear la nueva sala
     new_room = Room(**room_data.dict(), owner_id=current_user.id)
     db.add(new_room)
-    await db.flush()
-
-    current_user.current_room_id = new_room.id
     
+    # --- LA CORRECCIÓN CLAVE ESTÁ AQUÍ ---
+    # En lugar de asignar solo el ID, manejamos la relación directamente.
+    # Esto asegura que SQLAlchemy entienda que el usuario es un miembro de la sala.
+    new_room.members.append(current_user)
+    
+    # Hacemos el commit para que la transacción sea visible para todos
     await db.commit()
     
+    # Refrescamos los objetos para obtener su estado final desde la BD
     await db.refresh(new_room)
-    await db.refresh(current_user)
+    await db.refresh(new_room, attribute_names=['owner'])
 
     return new_room
 
 @app.get("/rooms", response_model=List[schemas.RoomOut])
 async def list_public_rooms(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Room).filter(Room.is_private == False).options(selectinload(Room.owner)))
+    query = (
+        select(Room)
+        .filter_by(is_private=False)
+        .options(selectinload(Room.owner))
+    )
+    result = await db.execute(query)
     rooms = result.scalars().all()
     return rooms
 
@@ -267,28 +277,27 @@ async def unban_user(username: str, db: AsyncSession = Depends(get_db)):
 #
 # WebSocket Endpoint
 #
-async def handle_websocket_data(data: str, sender_username: str, room_name: str, websocket: WebSocket):
+async def handle_websocket_text_data(data: str, sender_username: str, room_name: str, websocket: WebSocket):
+    """Procesa únicamente mensajes de texto (JSON) recibidos."""
     try:
         message_data = json.loads(data)
         msg_type = message_data.get("type")
-        content = message_data.get("content", "")
 
-        if msg_type == "internal":
-            if message_data.get("event") == "switching_room":
-                websocket.is_switching = True
+        # Mensajes de control para la transmisión de voz
+        if msg_type in ["voice_start", "voice_end"]:
+            message_to_broadcast = {"type": msg_type, "sender": sender_username}
+            await manager.broadcast_to_room(json.dumps(message_to_broadcast), room_name, exclude_websocket=websocket)
 
-        elif msg_type == "voice_message":
-            # Voice messages are only allowed inside rooms, not in the lobby.
-            if room_name != LOBBY_ROOM_NAME:
-                message_to_broadcast = {"type": "voice_message", "sender": sender_username, "content": content}
-                await manager.broadcast_to_room(json.dumps(message_to_broadcast), room_name, exclude_websocket=websocket)
-
+        # Mensaje de texto normal a la sala
         elif msg_type == "room_message":
+            content = message_data.get("content", "")
             message_to_broadcast = {"type": "message", "sender": sender_username, "content": content}
             await manager.broadcast_to_room(json.dumps(message_to_broadcast), room_name)
         
+        # Mensaje privado
         elif msg_type == "private_message":
             recipient = message_data.get("to")
+            content = message_data.get("content", "")
             if recipient:
                 pm_to_recipient = {"type": "private_message", "sender": sender_username, "content": content}
                 await manager.send_personal_message(json.dumps(pm_to_recipient), recipient)
@@ -297,10 +306,9 @@ async def handle_websocket_data(data: str, sender_username: str, room_name: str,
                 await manager.send_personal_message(json.dumps(pm_to_sender), sender_username)
 
     except (json.JSONDecodeError, AttributeError):
-        # Fallback for non-json messages, treat as a simple room message.
-        if room_name != LOBBY_ROOM_NAME:
-            message_to_broadcast = {"type": "message", "sender": sender_username, "content": data}
-            await manager.broadcast_to_room(json.dumps(message_to_broadcast), room_name)
+        # Fallback para texto plano que no es JSON
+        message_to_broadcast = {"type": "message", "sender": sender_username, "content": data}
+        await manager.broadcast_to_room(json.dumps(message_to_broadcast), room_name)
 
 @app.websocket("/ws/lobby")
 async def websocket_lobby(
@@ -326,7 +334,7 @@ async def websocket_lobby(
     try:
         while True:
             data = await websocket.receive_text()
-            await handle_websocket_data(data, username, LOBBY_ROOM_NAME, websocket)
+            await handle_websocket_text_data(data, username, LOBBY_ROOM_NAME, websocket)
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, username, LOBBY_ROOM_NAME)
@@ -336,8 +344,8 @@ async def websocket_lobby(
 
 @app.websocket("/ws/{room_name}")
 async def websocket_endpoint(
-    websocket: WebSocket, 
-    room_name: str, 
+    room_name: str,
+    websocket: WebSocket,
     token: str = Query(...),
     db: AsyncSession = Depends(get_db)
 ):
@@ -348,12 +356,8 @@ async def websocket_endpoint(
 
     result = await db.execute(select(Room).filter(Room.name == room_name))
     room = result.scalar_one_or_none()
-    if not room:
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Room not found")
-        return
-
-    if user.current_room_id != room.id:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="You must join the room first")
+    if not room or user.current_room_id != room.id:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Room not found or user not joined")
         return
 
     username = user.username
@@ -363,41 +367,52 @@ async def websocket_endpoint(
     await manager.broadcast_to_room(json.dumps(join_message), room_name, exclude_websocket=websocket)
 
     try:
+        # Bucle principal que acepta tanto texto como binarios
         while True:
-            data = await websocket.receive_text()
-            await handle_websocket_data(data, username, room_name, websocket)
+            message = await websocket.receive()
 
-    except WebSocketDisconnect:
+            if message["type"] == "websocket.disconnect":
+                break
+
+            if "text" in message:
+                await handle_websocket_text_data(message["text"], username, room_name, websocket)
+            
+            elif "bytes" in message:
+                await manager.broadcast_binary_to_room(message["bytes"], room_name, exclude_websocket=websocket)
+
+    finally:
+        # Lógica de limpieza que se ejecuta siempre al desconectar
         manager.disconnect(websocket, username, room_name)
         
-        # Announce to the room that the user has left, regardless of the reason.
         leave_message = {"type": "system", "content": f"{username} ha abandonado la mesa."}
-        await manager.broadcast_to_room(json.dumps(leave_message), room_name, exclude_websocket=websocket)
+        await manager.broadcast_to_room(json.dumps(leave_message), room_name)
 
         if not getattr(websocket, 'is_switching', False):
-            # This is a "true" disconnect (e.g., client closed), not just moving to the lobby.
-            # Announce the global disconnection to everyone.
             global_leave_message = {"type": "system", "content": f"{username} se ha desconectado del servidor."}
             await manager.broadcast_to_all(json.dumps(global_leave_message))
 
             if room:
-                # Update the user's state in the database since they truly left.
-                user.current_room_id = None
-                await db.commit()
+                # Usamos una nueva sesión para la limpieza para evitar problemas de "detached instance"
+                async with AsyncSessionLocal() as session:
+                    user_to_update = await session.get(User, user.id)
+                    if user_to_update:
+                        user_to_update.current_room_id = None
+                        await session.commit()
+                    
+                    room_to_check = await session.get(Room, room.id)
+                    if room_to_check:
+                        is_owner_leaving = room_to_check.owner_id == user.id
+                        result = await session.execute(select(func.count(User.id)).where(User.current_room_id == room_to_check.id))
+                        user_count = result.scalar()
 
-                # Handle room cleanup and ownership transfer if necessary.
-                is_owner_leaving = room.owner_id == user.id
-                result = await db.execute(select(func.count(User.id)).where(User.current_room_id == room.id))
-                user_count = result.scalar()
-
-                if user_count == 0:
-                    await db.delete(room)
-                    await db.commit()
-                elif is_owner_leaving:
-                    result = await db.execute(select(User).where(User.current_room_id == room.id).limit(1))
-                    new_owner = result.scalar_one_or_none()
-                    if new_owner:
-                        room.owner_id = new_owner.id
-                        await db.commit()
-                        announcement = {"type": "system", "event": "owner_change", "new_owner": new_owner.username, "content": f"{new_owner.username} es ahora el nuevo jefe de la mesa."}
-                        await manager.broadcast_to_room(json.dumps(announcement), room.name)
+                        if user_count == 0:
+                            await session.delete(room_to_check)
+                            await session.commit()
+                        elif is_owner_leaving:
+                            res = await session.execute(select(User).where(User.current_room_id == room_to_check.id).limit(1))
+                            new_owner = res.scalar_one_or_none()
+                            if new_owner:
+                                room_to_check.owner_id = new_owner.id
+                                await session.commit()
+                                announcement = {"type": "system", "event": "owner_change", "new_owner": new_owner.username, "content": f"{new_owner.username} es ahora el nuevo jefe de la mesa."}
+                                await manager.broadcast_to_room(json.dumps(announcement), room_to_check.name)
