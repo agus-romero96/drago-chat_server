@@ -279,6 +279,12 @@ async def handle_websocket_text_data(data: str, sender_username: str, room_name:
     try:
         message_data = json.loads(data)
         msg_type = message_data.get("type")
+        if msg_type == "internal":
+            if message_data.get("event") == "switching_room":
+                # Marcamos este websocket. Ahora, cuando se desconecte,
+                # el servidor sabrá que es un cambio de sala y no un cierre.
+                setattr(websocket, 'is_switching', True)
+            return
 
         # Mensajes de control para la transmisión de voz
         if msg_type in ["voice_start", "voice_end"]:
