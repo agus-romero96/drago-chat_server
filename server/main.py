@@ -15,9 +15,6 @@ from .auth import (
 )
 from .websocket_manager import manager
 from . import schemas
-from dotenv import load_dotenv
-
-load_dotenv() 
 
 app = FastAPI(title="DragoChat Server")
 
