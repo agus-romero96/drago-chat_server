@@ -11,7 +11,8 @@ from .database import create_db_and_tables, get_db, AsyncSessionLocal
 from .models import User, UserRole, Room
 from .auth import (
     get_password_hash, verify_password, create_access_token, 
-    get_current_active_user, require_role, get_current_user
+    get_current_active_user, require_role, get_current_user,
+    role_hierarchy
 )
 from .websocket_manager import manager
 from . import schemas
@@ -271,9 +272,61 @@ async def unban_user(username: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"message": f"User {username} has been unbanned."}
 
-#
-# WebSocket Endpoint
-#
+# expulsar usuarios de las salas 
+@app.post("/rooms/{room_name}/kick/{username_to_kick}", status_code=status.HTTP_204_NO_CONTENT)
+async def kick_user_from_room(
+    room_name: str,
+    username_to_kick: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Cargar la sala y el usuario a expulsar
+    room_result = await db.execute(select(Room).filter(Room.name == room_name))
+    room = room_result.scalar_one_or_none()
+    
+    user_to_kick_result = await db.execute(select(User).filter(User.username == username_to_kick))
+    user_to_kick = user_to_kick_result.scalar_one_or_none()
+
+    if not room or not user_to_kick:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sala o usuario no encontrado")
+
+    # --- LÓGICA DE PERMISOS REFINADA ---
+
+    # 1. Comprobación de permiso base: ¿Puede este usuario expulsar gente?
+    is_owner = room.owner_id == current_user.id
+    is_moderator_or_higher = role_hierarchy.get(current_user.role, 0) >= role_hierarchy.get(UserRole.MODERATOR, 0)
+
+    if not (is_owner or is_moderator_or_higher):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permiso para expulsar usuarios de esta sala")
+
+    # 2. Comprobaciones de inmunidad del objetivo: ¿Se puede expulsar a este usuario?
+    if user_to_kick.id == room.owner_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes expulsar al dueño de la mesa.")
+
+    # 3. Comprobaciones de jerarquía
+    # Si eres el dueño de la mesa...
+    if is_owner:
+        # No puedes expulsar a un moderador o admin del servidor, incluso de tu propia mesa.
+        if role_hierarchy.get(user_to_kick.role, 0) >= role_hierarchy.get(UserRole.MODERATOR, 0):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="El dueño de la mesa no puede expulsar a un moderador o administrador.")
+    # Si NO eres el dueño (lo que implica que eres un moderador/admin)...
+    else:
+        # Se aplica la regla de jerarquía estricta: no puedes expulsar a alguien de tu mismo rango o superior.
+        if role_hierarchy.get(user_to_kick.role, 0) >= role_hierarchy.get(current_user.role, 0):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes expulsar a un usuario con rol igual o superior.")
+
+    # Si se pasan todas las comprobaciones, la expulsión es válida.
+    user_to_kick.current_room_id = None
+    await db.commit()
+
+    # Notificaciones (sin cambios)
+    kick_announcement = {"type": "system", "content": f"{user_to_kick.username} ha sido expulsado de la mesa por {current_user.username}."}
+    await manager.broadcast_to_room(json.dumps(kick_announcement), room_name)
+    personal_kick_message = {"type": "system", "content": f"Has sido expulsado de la mesa '{room_name}'."}
+    await manager.send_personal_message(json.dumps(personal_kick_message), user_to_kick.username)
+
+    return
+
 async def handle_websocket_text_data(data: str, sender_username: str, room_name: str, websocket: WebSocket):
     """Procesa únicamente mensajes de texto (JSON) recibidos."""
     try:
