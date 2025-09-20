@@ -128,12 +128,21 @@ async def join_room(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(select(Room).filter(Room.name == room_name))
+    # La carga de la sala ahora debe incluir la lista de baneados
+    result = await db.execute(
+        select(Room).filter(Room.name == room_name).options(selectinload(Room.banned_users))
+    )
     room = result.scalar_one_or_none()
+
     if not room:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
+        
     if room.is_private and room.owner_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This room is private")
+
+    # --- NUEVA COMPROBACIÓN DE BANEO ---
+    if current_user in room.banned_users:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes unirte a esta mesa porque has sido baneado.")
 
     current_user.current_room_id = room.id
     await db.commit()
@@ -271,7 +280,7 @@ async def unban_user(username: str, db: AsyncSession = Depends(get_db)):
     user_to_unban.is_banned = False
     await db.commit()
     return {"message": f"User {username} has been unbanned."}
-
+# opciones de salas
 # expulsar usuarios de las salas 
 @app.post("/rooms/{room_name}/kick/{username_to_kick}", status_code=status.HTTP_204_NO_CONTENT)
 async def kick_user_from_room(
@@ -324,6 +333,59 @@ async def kick_user_from_room(
     await manager.broadcast_to_room(json.dumps(kick_announcement), room_name)
     personal_kick_message = {"type": "system", "content": f"Has sido expulsado de la mesa '{room_name}'."}
     await manager.send_personal_message(json.dumps(personal_kick_message), user_to_kick.username)
+
+    return
+
+# En server/main.py
+
+@app.post("/rooms/{room_name}/ban/{username_to_ban}", status_code=status.HTTP_204_NO_CONTENT)
+async def ban_user_from_room(
+    room_name: str,
+    username_to_ban: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    # Usamos selectinload para cargar las relaciones de forma eficiente
+    query = select(Room).filter(Room.name == room_name).options(selectinload(Room.banned_users))
+    room = (await db.execute(query)).scalar_one_or_none()
+    
+    user_to_ban = (await db.execute(select(User).filter(User.username == username_to_ban))).scalar_one_or_none()
+
+    if not room or not user_to_ban:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sala o usuario no encontrado")
+
+    # La lógica de permisos es idéntica a la de expulsar
+    is_owner = room.owner_id == current_user.id
+    is_moderator_or_higher = role_hierarchy.get(current_user.role, 0) >= role_hierarchy.get(UserRole.MODERATOR, 0)
+    if not (is_owner or is_moderator_or_higher):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tienes permiso para banear usuarios en esta sala")
+
+    # La lógica de jerarquía también es idéntica
+    if user_to_ban.id == room.owner_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes banear al dueño de la mesa.")
+    if is_owner and role_hierarchy.get(user_to_ban.role, 0) >= role_hierarchy.get(UserRole.MODERATOR, 0):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="El dueño de la mesa no puede banear a un moderador o administrador.")
+    if not is_owner and role_hierarchy.get(user_to_ban.role, 0) >= role_hierarchy.get(current_user.role, 0):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No puedes banear a un usuario con rol igual o superior.")
+
+    # --- LÓGICA DEL BANEO ---
+    # 1. Añadir al usuario a la lista negra de la sala
+    if user_to_ban not in room.banned_users:
+        room.banned_users.append(user_to_ban)
+
+    # 2. Expulsarlo de la sala si está dentro
+    if user_to_ban.current_room_id == room.id:
+        user_to_ban.current_room_id = None
+    
+    await db.commit()
+    # --- FIN DE LA LÓGICA ---
+
+    # Notificar a la sala
+    ban_announcement = {"type": "system", "content": f"{user_to_ban.username} ha sido baneado de la mesa por {current_user.username}."}
+    await manager.broadcast_to_room(json.dumps(ban_announcement), room_name)
+    # Notificar al usuario baneado
+    personal_ban_message = {"type": "system", "content": f"Has sido baneado de la mesa '{room_name}'."}
+    await manager.send_personal_message(json.dumps(personal_ban_message), user_to_ban.username)
 
     return
 

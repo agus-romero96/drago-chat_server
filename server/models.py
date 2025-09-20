@@ -1,9 +1,17 @@
-from sqlalchemy import Column, Integer, String, Enum, Boolean, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, Enum, Boolean, ForeignKey, Text, Table 
+# Asegúrate de que 'Table' esté con mayúscula
 from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 import enum
 
 Base = declarative_base()
+
+# --- TABLA DE ASOCIACIÓN PARA BANEOS (AÑADIDO) ---
+# Esta tabla no es una clase, es una definición directa que conecta usuarios y mesas para registrar los baneos.
+room_bans_table = Table('room_bans', Base.metadata,
+    Column('user_id', Integer, ForeignKey('users.id'), primary_key=True),
+    Column('room_id', Integer, ForeignKey('rooms.id'), primary_key=True)
+)
 
 class UserRole(enum.Enum):
     COMMON_USER = "common_user"
@@ -20,18 +28,18 @@ class User(Base):
     role = Column(Enum(UserRole), default=UserRole.COMMON_USER, nullable=False)
     
     status_message = Column(String(255), default="Online")
-    is_banned = Column(Boolean, default=False)
+    is_banned = Column(Boolean, default=False) # Este es el ban GLOBAL
 
     # Foreign Key to the room the user is currently in
     current_room_id = Column(Integer, ForeignKey("rooms.id"), nullable=True)
     
     # Relationships
-    # This defines the room a user is currently in.
     current_room = relationship("Room", back_populates="members", foreign_keys=[current_room_id])
-    
-    # This defines the list of rooms a user owns.
-    # We must specify foreign_keys as a string because Room is defined later.
     owned_rooms = relationship("Room", back_populates="owner", foreign_keys="Room.owner_id")
+
+    # --- RELACIÓN DE BANEO (AÑADIDO) ---
+    # Esto crea una lista `user.banned_from_rooms` que contiene todas las mesas de las que un usuario ha sido baneado.
+    banned_from_rooms = relationship("Room", secondary=room_bans_table, back_populates="banned_users")
 
 class Room(Base):
     __tablename__ = "rooms"
@@ -45,8 +53,9 @@ class Room(Base):
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
     # Relationships
-    # This defines the owner of the room.
     owner = relationship("User", back_populates="owned_rooms", foreign_keys=[owner_id])
-    
-    # This defines the list of users currently in the room.
     members = relationship("User", back_populates="current_room", foreign_keys=[User.current_room_id])
+
+    # --- RELACIÓN DE BANEO (AÑADIDO) ---
+    # Esto crea la "lista negra": `room.banned_users` contendrá todos los usuarios baneados de esta mesa.
+    banned_users = relationship("User", secondary=room_bans_table, back_populates="banned_from_rooms")
